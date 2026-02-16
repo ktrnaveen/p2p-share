@@ -3,6 +3,16 @@ import type { SignalEnvelope } from "./protocol";
 
 const EVENT_NAME = "signal";
 
+export type AblyConnectionState =
+  | "initialized"
+  | "connecting"
+  | "connected"
+  | "disconnected"
+  | "suspended"
+  | "closing"
+  | "closed"
+  | "failed";
+
 export class AblySignaling {
   private client: Ably.Realtime;
   private channel: Ably.RealtimeChannel;
@@ -31,6 +41,25 @@ export class AblySignaling {
     return () => {
       this.channel.unsubscribe(EVENT_NAME, wrapped);
     };
+  }
+
+  onConnectionStateChange(
+    handler: (state: AblyConnectionState, reason?: string) => void
+  ): () => void {
+    const listener = (stateChange: Ably.ConnectionStateChange) => {
+      const reason = stateChange.reason?.message;
+      handler(stateChange.current as AblyConnectionState, reason);
+    };
+
+    this.client.connection.on(listener);
+
+    return () => {
+      this.client.connection.off(listener);
+    };
+  }
+
+  getConnectionState(): AblyConnectionState {
+    return this.client.connection.state as AblyConnectionState;
   }
 
   close(): void {

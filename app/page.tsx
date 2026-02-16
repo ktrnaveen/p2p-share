@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { AblySignaling } from "@/lib/ablySignaling";
 import type { DataControl, FileMeta, Role } from "@/lib/protocol";
 import { createPeerConnection } from "@/lib/webrtc";
 
 const CHUNK_SIZE = 256 * 1024;
+const MAX_ICE_RESTARTS = 3;
 
 type ConnState = "idle" | "connecting" | "connected" | "failed";
 type ReceiveStorageMode = "memory" | "disk";
@@ -144,11 +145,13 @@ export default function HomePage() {
   const [saveHandleReady, setSaveHandleReady] = useState(false);
   const [activeReceiveMode, setActiveReceiveMode] = useState<ReceiveStorageMode>("memory");
   const [savedToDiskName, setSavedToDiskName] = useState<string | null>(null);
+  const [signalingState, setSignalingState] = useState<string>("idle");
 
   const signalingRef = useRef<AblySignaling | null>(null);
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const channelRef = useRef<RTCDataChannel | null>(null);
   const unsubRef = useRef<(() => void) | null>(null);
+  const unsubAblyStateRef = useRef<(() => void) | null>(null);
   const pendingIceRef = useRef<RTCIceCandidateInit[]>([]);
   const incomingChunksRef = useRef<BlobPart[]>([]);
   const incomingMetaRef = useRef<FileMeta | null>(null);
@@ -156,6 +159,21 @@ export default function HomePage() {
   const downloadUrlRef = useRef<string | null>(null);
   const saveHandleRef = useRef<unknown>(null);
   const writableRef = useRef<unknown>(null);
+
+  // --- Refs that mirror state to avoid stale closures in callbacks ---
+  const roleRef = useRef<Role>(role);
+  const targetPeerRef = useRef<string | null>(targetPeer);
+  const connStateRef = useRef<ConnState>(connState);
+  const peerIdRef = useRef<string>(peerId);
+  const iceRestartCountRef = useRef(0);
+  const roomIdRef = useRef<string>(roomId);
+
+  // Keep refs in sync with state
+  useEffect(() => { roleRef.current = role; }, [role]);
+  useEffect(() => { targetPeerRef.current = targetPeer; }, [targetPeer]);
+  useEffect(() => { connStateRef.current = connState; }, [connState]);
+  useEffect(() => { peerIdRef.current = peerId; }, [peerId]);
+  useEffect(() => { roomIdRef.current = roomId; }, [roomId]);
 
   const fileSystemAccessSupported = useMemo(() => {
     if (typeof window === "undefined") return false;
@@ -237,6 +255,9 @@ export default function HomePage() {
     unsubRef.current?.();
     unsubRef.current = null;
 
+    unsubAblyStateRef.current?.();
+    unsubAblyStateRef.current = null;
+
     signalingRef.current?.close();
     signalingRef.current = null;
 
@@ -247,6 +268,7 @@ export default function HomePage() {
     peerRef.current = null;
 
     pendingIceRef.current = [];
+    iceRestartCountRef.current = 0;
 
     if (resetUi) {
       setTargetPeer(null);
@@ -259,6 +281,7 @@ export default function HomePage() {
       incomingReceivedRef.current = 0;
       setActiveReceiveMode("memory");
       setSavedToDiskName(null);
+      setSignalingState("idle");
     }
   }
 
@@ -328,38 +351,117 @@ export default function HomePage() {
     }
   }
 
+  // --- ICE restart logic ---
+  const attemptIceRestart = useCallback(async () => {
+    const peer = peerRef.current;
+    const signaling = signalingRef.current;
+    const remotePeer = targetPeerRef.current;
+    const currentRole = roleRef.current;
+    const myPeerId = peerIdRef.current;
+
+    if (!peer || !signaling || !remotePeer) return;
+
+    if (iceRestartCountRef.current >= MAX_ICE_RESTARTS) {
+      setConnState("failed");
+      setStatusSafe("Connection failed after multiple retries");
+      return;
+    }
+
+    iceRestartCountRef.current += 1;
+    setStatusSafe(`Restarting ICE (attempt ${iceRestartCountRef.current}/${MAX_ICE_RESTARTS})...`);
+    setConnState("connecting");
+
+    try {
+      if (currentRole === "sender") {
+        const offer = await peer.createOffer({ iceRestart: true });
+        await peer.setLocalDescription(offer);
+        await signaling.publish({
+          kind: "offer",
+          from: myPeerId,
+          to: remotePeer,
+          payload: offer
+        });
+      } else {
+        // Receiver re-publishes join to trigger a fresh offer from sender
+        await signaling.publish({
+          kind: "join",
+          from: myPeerId
+        });
+      }
+    } catch {
+      setConnState("failed");
+      setStatusSafe("ICE restart failed");
+    }
+  }, []);
+
   async function connectSignaling(rid: string) {
-    if (!peerId) {
+    const myPeerId = peerIdRef.current;
+    if (!myPeerId) {
       throw new Error("Peer is still initializing");
     }
 
-    const signaling = new AblySignaling(rid, peerId);
+    const signaling = new AblySignaling(rid, myPeerId);
     signalingRef.current = signaling;
 
+    // Surface Ably connection state changes
+    unsubAblyStateRef.current = signaling.onConnectionStateChange((state, reason) => {
+      setSignalingState(state);
+      switch (state) {
+        case "connected":
+          setStatusSafe("Signaling connected");
+          break;
+        case "connecting":
+          setStatusSafe("Connecting to signaling server...");
+          break;
+        case "disconnected":
+          setStatusSafe("Signaling disconnected, attempting to reconnect...");
+          break;
+        case "suspended":
+          setStatusSafe("Signaling suspended — check your internet connection");
+          break;
+        case "failed":
+          setConnState("failed");
+          setStatusSafe(reason ? `Signaling failed: ${reason}` : "Signaling connection failed");
+          break;
+        default:
+          break;
+      }
+    });
+
     unsubRef.current = signaling.subscribe(async (msg) => {
-      if (msg.from === peerId) return;
-      if (msg.to && msg.to !== peerId) return;
+      // Read fresh values from refs, not stale closure state
+      const myId = peerIdRef.current;
+      const currentRole = roleRef.current;
+      const currentTarget = targetPeerRef.current;
+      const currentConn = connStateRef.current;
+
+      if (msg.from === myId) return;
+      if (msg.to && msg.to !== myId) return;
 
       try {
         switch (msg.kind) {
           case "join": {
-            if (role !== "sender") return;
-            if (targetPeer && targetPeer !== msg.from && connState === "connected") {
+            if (currentRole !== "sender") return;
+            if (currentTarget && currentTarget !== msg.from && currentConn === "connected") {
               setStatusSafe("A receiver is already connected");
               return;
             }
             setTargetPeer(msg.from);
+            targetPeerRef.current = msg.from;
+            iceRestartCountRef.current = 0;
             await createOffer(msg.from);
             break;
           }
           case "offer": {
-            if (role !== "receiver") return;
+            if (currentRole !== "receiver") return;
             setTargetPeer(msg.from);
+            targetPeerRef.current = msg.from;
+            iceRestartCountRef.current = 0;
             await onOffer(msg.from, msg.payload as RTCSessionDescriptionInit);
             break;
           }
           case "answer": {
-            if (role !== "sender") return;
+            if (currentRole !== "sender") return;
             await onAnswer(msg.payload as RTCSessionDescriptionInit);
             break;
           }
@@ -391,7 +493,7 @@ export default function HomePage() {
       if (!event.candidate) return;
       await signalingRef.current?.publish({
         kind: "ice",
-        from: peerId,
+        from: peerIdRef.current,
         to: remotePeer,
         payload: event.candidate.toJSON()
       });
@@ -401,20 +503,34 @@ export default function HomePage() {
       const state = peer.connectionState;
       if (state === "connected") {
         setConnState("connected");
+        connStateRef.current = "connected";
+        iceRestartCountRef.current = 0;
         setStatusSafe("Connected");
       } else if (state === "failed") {
-        setConnState("failed");
-        setStatusSafe("Connection failed");
+        setStatusSafe("Connection failed — attempting ICE restart...");
+        void attemptIceRestart();
       } else if (state === "disconnected") {
-        setConnState("failed");
-        setStatusSafe("Connection disconnected");
+        setStatusSafe("Connection interrupted — will retry shortly...");
+        // Brief delay before restart: disconnected can be transient
+        setTimeout(() => {
+          if (peerRef.current?.connectionState === "disconnected") {
+            void attemptIceRestart();
+          }
+        }, 2000);
       } else if (state === "connecting") {
         setConnState("connecting");
+        connStateRef.current = "connecting";
         setStatusSafe("Connecting...");
       }
     };
 
-    if (role === "receiver") {
+    peer.onicecandidateerror = (ev) => {
+      // Log for debugging but don't fail — individual candidate errors are normal
+      console.warn("ICE candidate error:", (ev as RTCPeerConnectionIceErrorEvent).errorText ?? ev);
+    };
+
+    const currentRole = roleRef.current;
+    if (currentRole === "receiver") {
       peer.ondatachannel = (ev) => {
         bindDataChannel(ev.channel);
       };
@@ -431,19 +547,29 @@ export default function HomePage() {
     ch.onopen = () => {
       setStatusSafe("Data channel open");
       setConnState("connected");
-      if (role === "receiver") {
-        void signalingRef.current?.publish({ kind: "ready", from: peerId, to: targetPeer ?? undefined });
+      connStateRef.current = "connected";
+      const currentRole = roleRef.current;
+      if (currentRole === "receiver") {
+        void signalingRef.current?.publish({
+          kind: "ready",
+          from: peerIdRef.current,
+          to: targetPeerRef.current ?? undefined
+        });
       }
     };
 
     ch.onclose = () => {
       setStatusSafe("Data channel closed");
-      if (connState !== "failed") setConnState("idle");
+      if (connStateRef.current !== "failed") {
+        setConnState("idle");
+        connStateRef.current = "idle";
+      }
     };
 
     ch.onerror = () => {
       setStatusSafe("Data channel error");
       setConnState("failed");
+      connStateRef.current = "failed";
     };
 
     ch.onmessage = async (ev) => {
@@ -461,7 +587,8 @@ export default function HomePage() {
           setIncomingMeta(control.payload);
           incomingMetaRef.current = control.payload;
           setDownloadName(control.payload.name);
-          if (role === "receiver" && preferDiskReceive && saveHandleRef.current) {
+          const currentRole = roleRef.current;
+          if (currentRole === "receiver" && preferDiskReceive && saveHandleRef.current) {
             try {
               const writable = await (
                 saveHandleRef.current as { createWritable: () => Promise<unknown> }
@@ -518,6 +645,7 @@ export default function HomePage() {
           ).write(chunk);
         } catch {
           setConnState("failed");
+          connStateRef.current = "failed";
           setStatusSafe("Disk write failed during transfer");
           await closeWritable(true);
           return;
@@ -545,7 +673,7 @@ export default function HomePage() {
 
     await signalingRef.current?.publish({
       kind: "offer",
-      from: peerId,
+      from: peerIdRef.current,
       to: remotePeer,
       payload: offer
     });
@@ -561,7 +689,7 @@ export default function HomePage() {
 
     await signalingRef.current?.publish({
       kind: "answer",
-      from: peerId,
+      from: peerIdRef.current,
       to: remotePeer,
       payload: answer
     });
@@ -587,7 +715,7 @@ export default function HomePage() {
   }
 
   async function startAsSender() {
-    if (!peerId) {
+    if (!peerIdRef.current) {
       setStatusSafe("Initializing peer identity...");
       return;
     }
@@ -596,17 +724,19 @@ export default function HomePage() {
       cleanup();
       const rid = randomId(10);
       setRoomId(rid);
+      roomIdRef.current = rid;
       setRoomLink(rid);
       setStatusSafe("Waiting for receiver...");
       await connectSignaling(rid);
     } catch {
       setConnState("failed");
+      connStateRef.current = "failed";
       setStatusSafe("Failed to create room");
     }
   }
 
   async function joinAsReceiver() {
-    if (!peerId) {
+    if (!peerIdRef.current) {
       setStatusSafe("Initializing peer identity...");
       return;
     }
@@ -620,14 +750,60 @@ export default function HomePage() {
     try {
       cleanup();
       setStatusSafe("Joining room...");
+      setConnState("connecting");
+      connStateRef.current = "connecting";
       await connectSignaling(rid);
       await signalingRef.current?.publish({
         kind: "join",
-        from: peerId
+        from: peerIdRef.current
       });
     } catch {
       setConnState("failed");
+      connStateRef.current = "failed";
       setStatusSafe("Failed to join room");
+    }
+  }
+
+  async function reconnect() {
+    const currentRole = roleRef.current;
+    const rid = roomIdRef.current.trim();
+    if (!rid || !peerIdRef.current) return;
+
+    setStatusSafe("Reconnecting...");
+    setConnState("connecting");
+    connStateRef.current = "connecting";
+    iceRestartCountRef.current = 0;
+
+    // Close old peer connection but keep signaling alive
+    channelRef.current?.close();
+    channelRef.current = null;
+    peerRef.current?.close();
+    peerRef.current = null;
+    pendingIceRef.current = [];
+
+    try {
+      if (signalingRef.current?.getConnectionState() !== "connected") {
+        // Signaling is also down — full reconnect
+        unsubRef.current?.();
+        unsubRef.current = null;
+        unsubAblyStateRef.current?.();
+        unsubAblyStateRef.current = null;
+        signalingRef.current?.close();
+        signalingRef.current = null;
+        await connectSignaling(rid);
+      }
+
+      if (currentRole === "receiver") {
+        await signalingRef.current?.publish({
+          kind: "join",
+          from: peerIdRef.current
+        });
+      }
+      // Sender just waits for a new join
+    } catch {
+      setConnState("failed");
+      connStateRef.current = "failed";
+      setStatusSafe("Reconnection failed");
     }
   }
 
@@ -677,11 +853,13 @@ export default function HomePage() {
       setStatusSafe("File sent");
     } catch {
       setConnState("failed");
+      connStateRef.current = "failed";
       setStatusSafe("Transfer interrupted");
     }
   }
 
   const canSendFile = connState === "connected" && Boolean(selectedFile);
+  const showReconnect = connState === "failed";
 
   return (
     <main className="container">
@@ -807,6 +985,12 @@ export default function HomePage() {
           </div>
         )}
 
+        {showReconnect && (
+          <button type="button" className="primary" onClick={reconnect} style={{ marginTop: "0.75rem" }}>
+            Reconnect
+          </button>
+        )}
+
         <div className="status">
           <p>
             <span>Status</span>
@@ -815,6 +999,10 @@ export default function HomePage() {
           <p>
             <span>Connection</span>
             <strong>{connState}</strong>
+          </p>
+          <p>
+            <span>Signaling</span>
+            <strong>{signalingState}</strong>
           </p>
           <p>
             <span>Your peer ID</span>

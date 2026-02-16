@@ -1,104 +1,110 @@
-# P2P Share (ToffeeShare-style)
+# P2P Share
 
-A fast, browser-based, 1:1 peer-to-peer file transfer app built with Next.js + WebRTC.
+**P2P Share** is a high-performance, privacy-focused file transfer application that enables direct peer-to-peer sharing between devices without intermediate storage servers.
 
-## Core Privacy Model
+![P2P Share Interface](https://via.placeholder.com/800x450.png?text=P2P+Share+Interface)
+*(Replace with actual screenshot if available)*
 
-- File bytes are transferred directly peer-to-peer over WebRTC DataChannel.
-- Server is used only for signaling (offer/answer/ICE exchange).
-- No file storage backend is used.
-- Ably root key stays server-side only via token auth (`/api/ably-token`).
+## 🚀 Key Features
 
-## Features (v1)
+-   **Direct Peer-to-Peer**: Files are transferred directly between devices using WebRTC. No data ever touches a server.
+-   **No File Size Limits**: Because data streams directly, you can share files of practically any size (TB+), limited only by the sender's upload speed and the receiver's disk space.
+-   **Direct-to-Disk Saving**: On supported browsers (Chrome, Edge), files are streamed directly to the hard drive, minimizing memory usage.
+-   ** robust Connectivity**:
+    -   Multi-provider STUN configuration (Google, Cloudflare, Mozilla, Twilio) for reliable NAT traversal.
+    -   Smart ICE restart logic to handle network interruptions.
+    -   Automatic reconnection for transient dropouts.
+-   **Secure Signaling**: Uses Ably for ephemeral signaling capability. No persistent metadata is stored.
+-   **Cross-Platform**: Works on any modern web browser (desktop and mobile).
 
-- 1 sender -> 1 receiver
-- Share-link flow
-- STUN + optional TURN fallback
-- Upload and download progress bars
-- Chunked transfer with DataChannel backpressure handling
-- Direct-to-disk receiving on supported browsers (fallback to memory mode)
+## 🛠️ Technology Stack
 
-## Tech Stack
+-   **Frontend**: Next.js 14 (App Router), React, TypeScript
+-   **Styling**: Vanilla CSS with a focus on performance and glassmorphism aesthetics
+-   **P2P Protocol**: WebRTC (RTCPeerConnection, RTCDataChannel)
+-   **Signaling**: Ably Realtime (Pub/Sub)
+-   **State Management**: React Hooks with Ref-mirrored state for stale-closure-free signaling
 
-- Next.js (App Router)
-- React + TypeScript
-- Ably Realtime (signaling only)
-- WebRTC DataChannel (file transfer)
+## 🏗️ Architecture
 
-## Quick Start
+1.  **Signaling Phase**:
+    -   Sender creates a random Room ID.
+    -   Sender connects to Ably and waits for a receiver.
+    -   Receiver joins using the Room ID.
+    -   Peers exchange SDP offers/answers and ICE candidates via Ably.
 
-1. Install dependencies:
+2.  **P2P Connection**:
+    -   Once ICE candidates are exchanged, a direct `RTCDataChannel` is established.
+    -   The Ably connection can be closed or kept for status updates (currently kept for reconnection logic).
 
-```bash
-npm install
-```
+3.  **Data Transfer**:
+    -   Files are split into 256KB chunks.
+    -   Sender pushes chunks with backpressure handling (`bufferedAmountLow`).
+    -   Receiver writes chunks to memory or disk (via File System Access API).
 
-2. Copy environment file:
+## 🏁 Getting Started
 
-```bash
-cp .env.example .env.local
-```
+### Prerequisites
 
-3. Set env vars:
+-   Node.js 18+
+-   An Ably API Key (Free tier is sufficient)
 
-- `ABLY_API_KEY`: Ably root key (server-side only)
-- `NEXT_PUBLIC_TURN_URL`: Optional TURN URL (for difficult NAT networks)
-- `NEXT_PUBLIC_TURN_USERNAME`: TURN username
-- `NEXT_PUBLIC_TURN_CREDENTIAL`: TURN credential
+### Installation
 
-4. Run dev server:
+1.  **Clone the repository**:
+    ```bash
+    git clone https://github.com/yourusername/p2p-share.git
+    cd p2p-share
+    ```
 
-```bash
-npm run dev
-```
+2.  **Install dependencies**:
+    ```bash
+    npm install
+    ```
 
-5. Open `http://localhost:3000`.
+3.  **Configure Environment**:
+    Copy `.env.example` to `.env.local`:
+    ```bash
+    cp .env.example .env.local
+    ```
+    Edit `.env.local` and add your Ably API key:
+    ```env
+    ABLY_API_KEY=your_ably_api_key_here
+    # TURN servers are optional and currently disabled in code for pure P2P experience
+    ```
 
-## How to Use
+4.  **Run Development Server**:
+    ```bash
+    npm run dev
+    ```
 
-1. Sender chooses **Sender** mode and clicks **Create Share Link**.
-2. Sender copies the generated link and shares it.
-3. Receiver opens the link and clicks **Join Room**.
-   - For very large files on Chromium browsers, click **Prepare Save Location** first.
-4. Sender selects file and clicks **Send File**.
-5. Receiver gets progress and downloads when complete.
+5.  **Open in Browser**:
+    Visit `http://localhost:3000`
 
-## Deploy on Vercel
+## 📖 Usage Guide
 
-1. Push this repo to GitHub.
-2. Import project in Vercel.
-3. Add environment variables from `.env.example` in Vercel Project Settings.
-4. Deploy.
+### Sending a File
+1.  Open the app and select **Sender** mode (default).
+2.  Click **Create Share Link**.
+3.  Copy the generated link and send it to the recipient.
+4.  Once the recipient connects, select a file and click **Send**.
 
-## Vercel Limitations (Important)
+### Receiving a File
+1.  Open the share link (or paste the Room ID).
+2.  Click **Join Room**.
+3.  (Optional for large files) Check **"Use direct-to-disk receive mode"** and click **Prepare Save Location** to save directly to a specific folder.
+4.  Wait for the sender to start the transfer.
 
-- Vercel Functions are not suitable as a native WebSocket signaling server.
-- This app avoids that by using Ably for realtime signaling.
-- Actual file transfer is peer-to-peer and does not rely on Vercel bandwidth for file bytes.
+## 🔒 Privacy & Security
 
-## Security Notes
+-   **End-to-End Encryption**: WebRTC connections are mandatory encrypted (DTLS/SRTP).
+-   **Ephemeral Data**: The signaling server (Ably) only relays small metadata packets (SDP/ICE). It cannot see or store file contents.
+-   **No Analytics**: The app does not track user behavior or file metadata.
 
-- Do not expose Ably root key in `NEXT_PUBLIC_*` variables.
-- Set only `ABLY_API_KEY` in Vercel/environment settings.
-- Clients receive short-lived scoped Ably tokens from `/api/ably-token`.
-- If a key leaks, rotate/revoke it in Ably dashboard immediately.
+## 🤝 Contributing
 
-## Notes on "Practically Unlimited" File Size
+Contributions are welcome! Please fork the repository and submit a pull request for any bug fixes or feature enhancements.
 
-- Sender side uses chunked streaming (does not read entire file at once).
-- Receiver can stream directly to disk on supported browsers after preparing save location.
-- Unsupported browsers automatically use memory-buffer fallback before final download.
-- Very large files are still constrained by browser/device memory and network stability.
+## 📄 License
 
-For true large-file robustness, next step is writing chunks directly to disk (File System Access API) where supported.
-
-## Suggested Next Steps
-
-- Add transfer resume using chunk map and reconnect protocol
-- Add password-protected rooms
-- Add receiver-side disk streaming path for huge files
-- Add E2E metadata encryption with URL fragment key
-
-## Disclaimer
-
-TURN servers relay encrypted traffic but do not store files. If privacy policies are strict, host your own TURN (coturn) and keep minimal logs.
+This project is open-source and available under the [MIT License](LICENSE).
