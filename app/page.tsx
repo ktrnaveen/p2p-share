@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { QRCodeSVG } from "qrcode.react";
 import { AblySignaling } from "@/lib/ablySignaling";
 import type { DataControl, FileMeta, Role } from "@/lib/protocol";
 import { createPeerConnection } from "@/lib/webrtc";
@@ -132,6 +133,7 @@ export default function HomePage() {
   const [status, setStatus] = useState("Ready");
   const [connState, setConnState] = useState<ConnState>("idle");
   const [shareLink, setShareLink] = useState("");
+  const [showQr, setShowQr] = useState(false);
   const [peerId, setPeerId] = useState("");
   const [targetPeer, setTargetPeer] = useState<string | null>(null);
   const [sendProgress, setSendProgress] = useState(0);
@@ -742,15 +744,35 @@ export default function HomePage() {
               <div className="share">
                 <p>Share this link:</p>
                 <code>{shareLink}</code>
-                <button
-                  type="button"
-                  onClick={async () => {
-                    const ok = await copyText(shareLink);
-                    setStatusSafe(ok ? "Link copied" : "Copy failed. Copy manually.");
-                  }}
-                >
-                  Copy Link
-                </button>
+                <div className="share-buttons">
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const ok = await copyText(shareLink);
+                      setStatusSafe(ok ? "Link copied" : "Copy failed. Copy manually.");
+                    }}
+                  >
+                    Copy Link
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowQr((v) => !v)}
+                  >
+                    {showQr ? "Hide QR" : "Show QR"}
+                  </button>
+                </div>
+                {showQr && (
+                  <div className="qr-box">
+                    <QRCodeSVG
+                      value={shareLink}
+                      size={180}
+                      level="M"
+                      bgColor="#ffffff"
+                      fgColor="#111827"
+                    />
+                    <span className="qr-hint">Scan with your phone to receive files</span>
+                  </div>
+                )}
               </div>
             )}
 
