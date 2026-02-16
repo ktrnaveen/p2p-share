@@ -9,7 +9,7 @@ export type FileMeta = {
 };
 
 export type SignalEnvelope = {
-  kind: "join" | "offer" | "answer" | "ice" | "ready";
+  kind: "join" | "offer" | "answer" | "ice" | "ice-batch" | "ready";
   from: string;
   to?: string;
   payload?: unknown;
@@ -17,9 +17,9 @@ export type SignalEnvelope = {
 
 export type DataControl =
   | {
-      kind: "meta";
-      payload: FileMeta;
-    }
+    kind: "meta";
+    payload: FileMeta;
+  }
   | {
-      kind: "done";
-    };
+    kind: "done";
+  };

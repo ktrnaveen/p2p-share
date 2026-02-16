@@ -3,10 +3,18 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { AblySignaling } from "@/lib/ablySignaling";
 import type { DataControl, FileMeta, Role } from "@/lib/protocol";
-import { createPeerConnection } from "@/lib/webrtc";
+import {
+  createPeerConnection,
+  waitForIceGatheringComplete,
+  parseCandidateInfo,
+  detectNatType,
+  type CandidateInfo,
+  type NatType,
+} from "@/lib/webrtc";
 
 const CHUNK_SIZE = 256 * 1024;
-const MAX_ICE_RESTARTS = 3;
+const MAX_ICE_RESTARTS = 5;
+const ICE_GATHER_TIMEOUT_MS = 5000;
 
 type ConnState = "idle" | "connecting" | "connected" | "failed";
 type ReceiveStorageMode = "memory" | "disk";
@@ -146,6 +154,9 @@ export default function HomePage() {
   const [activeReceiveMode, setActiveReceiveMode] = useState<ReceiveStorageMode>("memory");
   const [savedToDiskName, setSavedToDiskName] = useState<string | null>(null);
   const [signalingState, setSignalingState] = useState<string>("idle");
+  const [iceGatheringState, setIceGatheringState] = useState<string>("new");
+  const [gatheredCandidates, setGatheredCandidates] = useState<CandidateInfo[]>([]);
+  const [detectedNat, setDetectedNat] = useState<NatType>("unknown");
 
   const signalingRef = useRef<AblySignaling | null>(null);
   const peerRef = useRef<RTCPeerConnection | null>(null);
@@ -167,6 +178,7 @@ export default function HomePage() {
   const peerIdRef = useRef<string>(peerId);
   const iceRestartCountRef = useRef(0);
   const roomIdRef = useRef<string>(roomId);
+  const gatheredCandidatesRef = useRef<CandidateInfo[]>([]);
 
   // Keep refs in sync with state
   useEffect(() => { roleRef.current = role; }, [role]);
@@ -269,6 +281,7 @@ export default function HomePage() {
 
     pendingIceRef.current = [];
     iceRestartCountRef.current = 0;
+    gatheredCandidatesRef.current = [];
 
     if (resetUi) {
       setTargetPeer(null);
@@ -282,6 +295,9 @@ export default function HomePage() {
       setActiveReceiveMode("memory");
       setSavedToDiskName(null);
       setSignalingState("idle");
+      setIceGatheringState("new");
+      setGatheredCandidates([]);
+      setDetectedNat("unknown");
     }
   }
 
@@ -363,7 +379,7 @@ export default function HomePage() {
 
     if (iceRestartCountRef.current >= MAX_ICE_RESTARTS) {
       setConnState("failed");
-      setStatusSafe("Connection failed after multiple retries");
+      setStatusSafe("Connection failed after multiple retries. Your network may require a relay server.");
       return;
     }
 
@@ -375,12 +391,36 @@ export default function HomePage() {
       if (currentRole === "sender") {
         const offer = await peer.createOffer({ iceRestart: true });
         await peer.setLocalDescription(offer);
+
+        // Wait for re-gathering before sending
+        setIceGatheringState("gathering");
+        const restarted: CandidateInfo[] = [];
+        const gathered = await waitForIceGatheringComplete(peer, ICE_GATHER_TIMEOUT_MS, (c) => {
+          const info = parseCandidateInfo(c);
+          restarted.push(info);
+        });
+        gatheredCandidatesRef.current = restarted;
+        setGatheredCandidates(restarted);
+        setDetectedNat(detectNatType(restarted));
+        setIceGatheringState("complete");
+
+        // Send the offer with gathered candidates embedded in localDescription
         await signaling.publish({
           kind: "offer",
           from: myPeerId,
           to: remotePeer,
-          payload: offer
+          payload: peer.localDescription!.toJSON()
         });
+
+        // Also send candidates as a batch for redundancy
+        if (gathered.length > 0) {
+          await signaling.publish({
+            kind: "ice-batch",
+            from: myPeerId,
+            to: remotePeer,
+            payload: gathered.map((c) => c.toJSON())
+          });
+        }
       } else {
         // Receiver re-publishes join to trigger a fresh offer from sender
         await signaling.publish({
@@ -469,6 +509,16 @@ export default function HomePage() {
             await onIce(msg.payload as RTCIceCandidateInit);
             break;
           }
+          case "ice-batch": {
+            // Process a batch of ICE candidates sent after gathering completed
+            const candidates = msg.payload as RTCIceCandidateInit[];
+            if (Array.isArray(candidates)) {
+              for (const candidate of candidates) {
+                await onIce(candidate);
+              }
+            }
+            break;
+          }
           case "ready": {
             setStatusSafe("Peer is ready");
             break;
@@ -485,10 +535,16 @@ export default function HomePage() {
 
   function makePeerConnection(remotePeer: string) {
     peerRef.current?.close();
+    gatheredCandidatesRef.current = [];
+    setGatheredCandidates([]);
+    setDetectedNat("unknown");
+    setIceGatheringState("new");
 
     const peer = createPeerConnection();
     peerRef.current = peer;
 
+    // Trickle ICE candidates individually as a fallback path
+    // (the primary path sends candidates as a batch after gathering completes)
     peer.onicecandidate = async (event) => {
       if (!event.candidate) return;
       await signalingRef.current?.publish({
@@ -499,19 +555,27 @@ export default function HomePage() {
       });
     };
 
+    // Track ICE gathering state for diagnostics
+    peer.onicegatheringstatechange = () => {
+      setIceGatheringState(peer.iceGatheringState);
+    };
+
     peer.onconnectionstatechange = () => {
       const state = peer.connectionState;
       if (state === "connected") {
         setConnState("connected");
         connStateRef.current = "connected";
         iceRestartCountRef.current = 0;
-        setStatusSafe("Connected");
+        setStatusSafe("Connected ✓");
       } else if (state === "failed") {
-        setStatusSafe("Connection failed — attempting ICE restart...");
+        const nat = detectNatType(gatheredCandidatesRef.current);
+        const hint = nat === "symmetric"
+          ? " (symmetric NAT detected — direct P2P may not be possible on this network)"
+          : "";
+        setStatusSafe(`Connection failed${hint} — attempting ICE restart...`);
         void attemptIceRestart();
       } else if (state === "disconnected") {
         setStatusSafe("Connection interrupted — will retry shortly...");
-        // Brief delay before restart: disconnected can be transient
         setTimeout(() => {
           if (peerRef.current?.connectionState === "disconnected") {
             void attemptIceRestart();
@@ -525,7 +589,6 @@ export default function HomePage() {
     };
 
     peer.onicecandidateerror = (ev) => {
-      // Log for debugging but don't fail — individual candidate errors are normal
       console.warn("ICE candidate error:", (ev as RTCPeerConnectionIceErrorEvent).errorText ?? ev);
     };
 
@@ -668,15 +731,50 @@ export default function HomePage() {
     });
     bindDataChannel(channel);
 
+    setStatusSafe("Creating offer & gathering ICE candidates...");
+    setConnState("connecting");
+    connStateRef.current = "connecting";
+
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
 
+    // Wait for ICE gathering to complete (or timeout) so the offer
+    // includes ALL reflexive candidates — critical for symmetric NAT
+    setIceGatheringState("gathering");
+    const localCandidates: CandidateInfo[] = [];
+    const gathered = await waitForIceGatheringComplete(peer, ICE_GATHER_TIMEOUT_MS, (c) => {
+      const info = parseCandidateInfo(c);
+      localCandidates.push(info);
+      gatheredCandidatesRef.current = [...localCandidates];
+      setGatheredCandidates([...localCandidates]);
+    });
+
+    // Detect NAT type from gathered candidates
+    const nat = detectNatType(localCandidates);
+    setDetectedNat(nat);
+    setIceGatheringState("complete");
+
+    const candidateCount = localCandidates.length;
+    const srflxCount = localCandidates.filter((c) => c.type === "srflx").length;
+    setStatusSafe(`Gathered ${candidateCount} candidates (${srflxCount} reflexive). NAT: ${nat}. Sending offer...`);
+
+    // Send offer with all candidates embedded in localDescription SDP
     await signalingRef.current?.publish({
       kind: "offer",
       from: peerIdRef.current,
       to: remotePeer,
-      payload: offer
+      payload: peer.localDescription!.toJSON()
     });
+
+    // Also send all candidates as a batch for redundant delivery
+    if (gathered.length > 0) {
+      await signalingRef.current?.publish({
+        kind: "ice-batch",
+        from: peerIdRef.current,
+        to: remotePeer,
+        payload: gathered.map((c) => c.toJSON())
+      });
+    }
   }
 
   async function onOffer(remotePeer: string, offer: RTCSessionDescriptionInit) {
@@ -684,15 +782,46 @@ export default function HomePage() {
     await peer.setRemoteDescription(offer);
     await flushPendingIce();
 
+    setStatusSafe("Received offer. Creating answer & gathering ICE candidates...");
+
     const answer = await peer.createAnswer();
     await peer.setLocalDescription(answer);
 
+    // Wait for ICE gathering to complete on the answerer side too
+    setIceGatheringState("gathering");
+    const localCandidates: CandidateInfo[] = [];
+    const gathered = await waitForIceGatheringComplete(peer, ICE_GATHER_TIMEOUT_MS, (c) => {
+      const info = parseCandidateInfo(c);
+      localCandidates.push(info);
+      gatheredCandidatesRef.current = [...localCandidates];
+      setGatheredCandidates([...localCandidates]);
+    });
+
+    const nat = detectNatType(localCandidates);
+    setDetectedNat(nat);
+    setIceGatheringState("complete");
+
+    const candidateCount = localCandidates.length;
+    const srflxCount = localCandidates.filter((c) => c.type === "srflx").length;
+    setStatusSafe(`Gathered ${candidateCount} candidates (${srflxCount} reflexive). NAT: ${nat}. Sending answer...`);
+
+    // Send answer with all candidates embedded in localDescription SDP
     await signalingRef.current?.publish({
       kind: "answer",
       from: peerIdRef.current,
       to: remotePeer,
-      payload: answer
+      payload: peer.localDescription!.toJSON()
     });
+
+    // Also send all candidates as a batch
+    if (gathered.length > 0) {
+      await signalingRef.current?.publish({
+        kind: "ice-batch",
+        from: peerIdRef.current,
+        to: remotePeer,
+        payload: gathered.map((c) => c.toJSON())
+      });
+    }
   }
 
   async function onAnswer(answer: RTCSessionDescriptionInit) {
@@ -1004,6 +1133,25 @@ export default function HomePage() {
             <span>Signaling</span>
             <strong>{signalingState}</strong>
           </p>
+          <p>
+            <span>ICE gathering</span>
+            <strong>{iceGatheringState}</strong>
+          </p>
+          <p>
+            <span>NAT type</span>
+            <strong>{detectedNat}</strong>
+          </p>
+          {gatheredCandidates.length > 0 && (
+            <p>
+              <span>Candidates</span>
+              <strong>
+                {gatheredCandidates.filter((c) => c.type === "host").length} host,{" "}
+                {gatheredCandidates.filter((c) => c.type === "srflx").length} srflx,{" "}
+                {gatheredCandidates.filter((c) => c.type === "relay").length} relay,{" "}
+                {gatheredCandidates.filter((c) => c.type === "prflx").length} prflx
+              </strong>
+            </p>
+          )}
           <p>
             <span>Your peer ID</span>
             <strong>{peerId || "initializing..."}</strong>
